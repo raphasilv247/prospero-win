@@ -1,0 +1,172 @@
+name: "Build SART Prefix for PS5"
+
+on:
+  workflow_dispatch:
+    inputs:
+      sart_archive:
+        description: "SART game archive filename (e.g., SART-game.zip)"
+        required: true
+        default: "SART-game.zip"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build-sart-prefix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: "Checkout prospero-win"
+        uses: actions/checkout@v4
+        with:
+          repository: "${{ github.repository_owner }}/prospero-win"
+          path: "prospero-win"
+
+      - name: "Checkout prospero-win-profiles"
+        uses: actions/checkout@v4
+        with:
+          repository: "${{ github.repository_owner }}/prospero-win-profiles"
+          path: "prospero-win-profiles"
+
+      - name: "Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "Install dependencies"
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq \
+            python3-pyyaml \
+            wine \
+            wine32 \
+            wine64 \
+            p7zip-full \
+            unzip \
+            curl
+
+      - name: "Download SART game archive from Release"
+        run: |
+          cd /tmp
+
+          # Get the SART archive from releases
+          RELEASE_TAG="sart-game-latest"
+          ARCHIVE_NAME="${{ inputs.sart_archive }}"
+
+          echo "Downloading: $ARCHIVE_NAME from release: $RELEASE_TAG"
+
+          curl -L -o "$ARCHIVE_NAME" \
+            "https://github.com/${{ github.repository_owner }}/prospero-win-profiles/releases/download/$RELEASE_TAG/$ARCHIVE_NAME"
+
+          if [ ! -f "$ARCHIVE_NAME" ]; then
+            echo "ERROR: Archive not found!"
+            echo "Make sure you uploaded $ARCHIVE_NAME to release: $RELEASE_TAG"
+            exit 1
+          fi
+
+          echo "✓ Downloaded: $ARCHIVE_NAME"
+          ls -lh "$ARCHIVE_NAME"
+
+      - name: "Extract SART game"
+        run: |
+          cd /tmp
+          ARCHIVE_NAME="${{ inputs.sart_archive }}"
+
+          unzip -q "$ARCHIVE_NAME" -d SART-extract
+          ls -la SART-extract/
+
+          # Find the actual SART folder (might be nested)
+          find SART-extract -name "ASN_App.exe" -type f
+
+          # Set the path for later use
+          SART_PATH=$(find SART-extract -type d -name "SART" | head -1)
+          if [ -z "$SART_PATH" ]; then
+            # Fallback: use first directory with ASN_App.exe
+            SART_PATH=$(dirname $(find SART-extract -name "ASN_App.exe" | head -1))
+          fi
+
+          echo "SART_PATH=$SART_PATH" >> $GITHUB_ENV
+          ls -lh "$SART_PATH/"
+
+      - name: "Build SART prefix with pw_install.py"
+        run: |
+          mkdir -p ~/prospero-library
+
+          python3 prospero-win/tools/pw_install.py \
+            prospero-win-profiles/recipes/sart.yml \
+            --library ~/prospero-library \
+            --wine /usr/bin/wine \
+            --file game="$SART_PATH"
+        env:
+          SART_PATH: ${{ env.SART_PATH }}
+
+      - name: "Create profile"
+        run: |
+          mkdir -p ~/prospero-library/profiles
+          cp prospero-win-profiles/profiles/sart.profile ~/prospero-library/profiles/
+          ls -lh ~/prospero-library/profiles/
+
+      - name: "Package prefix"
+        run: |
+          cd ~/prospero-library
+
+          echo "Packaging prefix..."
+          tar -czf /tmp/sart-prefix.tar.gz \
+            prefixes/sart \
+            profiles/sart.profile
+
+          echo "✓ Packaged!"
+          ls -lh /tmp/sart-prefix.tar.gz
+
+      - name: "Upload prefix as artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: "sart-prefix"
+          path: "/tmp/sart-prefix.tar.gz"
+          retention-days: 30
+
+      - name: "Create GitHub Release for prefix"
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            /tmp/sart-prefix.tar.gz
+          tag_name: "sart-prefix-build-${{ github.run_number }}"
+          body: |
+            # SART Prefix Build #${{ github.run_number }}
+
+            ✓ Prefix successfully built for PS5!
+
+            ## How to Use
+
+            ### 1. Download and Extract
+            ```bash
+            tar -xzf sart-prefix.tar.gz -C ~/prospero-library
+            ```
+
+            ### 2. Push to PS5
+            ```bash
+            cd prospero-win
+            python3 tools/pw_prefix.py push sart \
+              --library ~/prospero-library \
+              --host <PS5_IP_ADDRESS> \
+              --cpu-dll <wine-build>/dlls/wowprospero/x86_64-windows/wowprospero.dll
+            ```
+
+            Replace `<PS5_IP_ADDRESS>` with your PS5's IP (e.g., 192.168.1.100)
+
+            ### 3. Restart prospero-win on PS5
+
+            You should now see **SART** in the launcher! 🎮
+
+            ---
+
+            **Build Info:**
+            - GitHub Run: ${{ github.run_id }}
+            - Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+            - Archive: ${{ inputs.sart_archive }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
