@@ -1,5 +1,6 @@
 dev.conf.example
 .github/workflows/ci.yml
+.github/workflows/dinput-build.yml
 CONTRIBUTING.md
 docs/ARCHITECTURE.md
 docs/CASE_STUDY_PINBALL.md
