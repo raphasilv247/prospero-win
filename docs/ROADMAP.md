@@ -6,8 +6,9 @@
 - **More OpenGL games.** Game profiles can select the PS5 OpenGL backend
   alongside DXVK. Broaden compatibility and reduce draw overhead in the SDK;
   its legacy WGL support is awaiting upstream review.
-- **DirectInput controllers.** Today the DualSense reaches games as a
-  keyboard and mouse, or as an Xbox controller through XInput.
+- **DirectInput force feedback.** The DualSense reaches games as a keyboard
+  and mouse, or as an Xbox controller through XInput and DirectInput;
+  rumble works through XInput only.
 - **Speed.** The x86 translator reaches 85–93% of native speed on the
   benchmarks; startup and frame pacing come next, measured against native
   runs.

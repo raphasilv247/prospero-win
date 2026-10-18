@@ -97,11 +97,15 @@ SDL2 opens it as a game controller.
 
 ### DirectInput
 
-Games that read a controller through DirectInput (many games from before
-2005 or so) don't see the DualSense yet. Play them with a keyboard-and-mouse
-preset instead. Keyboard and mouse input through DirectInput should work,
-since it comes from the same place as normal Windows input, but it hasn't
-been tested.
+In xinput mode the DualSense is also a DirectInput gamepad, laid out as an
+Xbox 360 controller is on Windows: X and Y for the left stick, Z for the
+triggers (left positive), X and Y rotation for the right stick, a hat
+switch for the d-pad and ten buttons (A, B, X, Y, LB, RB, Back, Start, L3,
+R3). A game finds it when it lists its devices, so start the game with the
+controller connected. There is no force feedback through DirectInput yet
+(XInput rumble works). In keyboard mode there is no DirectInput controller;
+keyboard and mouse input through DirectInput comes from the same place as
+normal Windows input.
 
 ### A second player
 

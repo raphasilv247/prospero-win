@@ -85,6 +85,7 @@ before evaluating a candidate built from that cache.
 | 0457 | `win32u`: the WoW64 placed-map check reads its properties through `vkGetPhysicalDeviceProperties2KHR`; the core entry point is NULL on win32u's Vulkan 1.0 instances, so a host with `VK_EXT_map_memory_placed` (RADV) crashed every 32-bit process |
 | 0460 | `win32u`: the PS5 user driver's Vulkan driver: a win32 surface becomes a host display-plane surface in the display's native mode, after the title releases its video output (before the first display query); installing the driver from Vulkan's initialisation does not refresh the display cache, which would wait on that initialisation |
 | 0470 | `xinput`: controller 0 is the PS5 title's, read through a Unix library (`xinput1_3.so`) from the title's sink; elsewhere xinput uses HID as before; see [XInput controller](#xinput-controller) |
+| 0475 | `dinput`, `dinput8`: the PS5 title's controller is a DirectInput gamepad (Xbox 360 layout: X/Y, Z for the triggers, X/Y rotation, a hat switch, ten buttons), read through the same `xinput1_3.so` as patch 0470 and listed after the HID devices; with no title or no controller connected, dinput lists what it always did; no force feedback yet |
 | 0500 | `ntdll`: signal context at `ucontext`+64 (measured); GS = TEB through `sysarch`; FS stays the libc TLS base, so the syscall dispatcher never switches it; no LDT for WoW64 threads |
 | 0501 | `ntdll`: a signal's FP state is read at `ucontext`+320, where the PS5 kernel keeps its FXSAVE image (32 bytes past the SDK's `mc_fpstate`), with the XSAVE header and YMM upper halves after it (measured); a handled exception's `CONTEXT` used to carry MXCSR 0 and shifted XMM registers |
 | 0510 | `ntdll`: 16 KiB host pages under 4 KiB Windows pages, reusing the large-host-page path of `virtual.c` |
@@ -603,6 +604,25 @@ To use it on the console:
   the prefix's `syswow64` (i386) and `system32` (x86_64);
 - give the game's profile `[input] mode = xinput` (see
   [Starting Wine in the title](#starting-wine-in-the-title)).
+
+## DirectInput controller
+
+Patch 0475 gives `dinput` and `dinput8` (one source tree, so one patch) a
+joystick for the same controller. A title has no `winedevice`, so the HID
+stack `joystick_hid.c` lists joysticks through is not there. `joystick_ps5.c`
+calls the Unix library of patch 0470 (`xinput1_3.so`, loaded by name; there
+is no library of its own) and adds the controller to the joystick cache after
+the HID devices, when one is connected; `hid_joystick_create_device` creates
+it for its path. Without the library (anywhere but a title) nothing changes.
+
+The device reports 045e:028e and a path with `ig_00`, as xinput does. Its
+objects are X, Y, Z (triggers), X and Y rotation, one hat switch and ten
+buttons; axes keep the application's range, dead zone and saturation. A
+periodic timer (8 ms) is the report event the input thread waits on, and Poll
+reads the newest state. No force feedback. `dinput.dll` and `dinput8.dll`
+are in `PE_MODULES`, so release packaging copies them over the host's.
+Testing needs a title: start a DirectInput game with the controller on and
+watch the game's controller screen (`WINEDEBUG=+dinput` traces the device).
 
 ## WoW64 CPU backend
 

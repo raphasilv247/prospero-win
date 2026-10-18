@@ -1,0 +1,731 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Sat, 17 Oct 2026 12:00:00 +0200
+Subject: [PATCH] dinput: Offer the PS5 title's controller as a joystick.
+
+A PS5 title runs Wine in its own process and cannot start winedevice, so
+the HID stack that dinput enumerates joysticks through (winebus, hidclass)
+is never there, and a game that reads its controller through DirectInput
+found none (patch 0470 gave XInput its controller, nothing gave dinput
+one).
+
+dinput gains a joystick, joystick_ps5.c, for the controller the title
+keeps in its sink. It reads that state through the Unix library patch 0470
+adds to xinput (xinput1_3.so, loaded by name, so there is no library of its
+own): where the library is missing, as anywhere but in a title, or the title
+has no controller connected, joystick_hid.c lists what it always did.
+- hid_joystick_refresh_devices adds the controller to the joystick cache
+  under a path of its own, after the HID devices, and a failed HID listing
+  no longer hides it;
+- hid_joystick_create_device creates this joystick for that path.
+dinput and dinput8 build the same sources, so both see it.
+
+The device is laid out as an Xbox 360 controller is on Windows: X and Y
+(left stick, y down), Z (the triggers, the left one positive), X and Y
+rotation (right stick), a hat switch (the d-pad) and ten buttons (A, B, X,
+Y, LB, RB, Back, Start, L3, R3). It reports 045e:028e, as xinput does, and
+a path with "ig_00" in it, for games that leave XInput controllers to
+XInput. The axes keep the application's range, dead zone and saturation
+as joystick_hid.c's do. A periodic timer stands in for the report event of
+a HID device, so buffered data and event notifications keep flowing between
+polls, and Poll reads the newest state. There is no force feedback yet.
+---
+ dlls/dinput/Makefile.in      |   1 +
+ dlls/dinput/dinput_private.h |   5 +
+ dlls/dinput/joystick_hid.c   |  11 +
+ dlls/dinput/joystick_ps5.c   | 614 +++++++++++++++++++++++++++++++++++
+ dlls/dinput8/Makefile.in     |   1 +
+ 5 files changed, 632 insertions(+)
+
+diff --git a/dlls/dinput/Makefile.in b/dlls/dinput/Makefile.in
+--- a/dlls/dinput/Makefile.in
++++ b/dlls/dinput/Makefile.in
+@@ -16,5 +16,6 @@ SOURCES = \
+ 	dinput_classes.idl \
+ 	dinput_main.c \
+ 	joystick_hid.c \
++	joystick_ps5.c \
+ 	keyboard.c \
+ 	mouse.c
+diff --git a/dlls/dinput/dinput_private.h b/dlls/dinput/dinput_private.h
+--- a/dlls/dinput/dinput_private.h
++++ b/dlls/dinput/dinput_private.h
+@@ -59,6 +59,11 @@ extern HRESULT hid_joystick_create_device( struct dinput *dinput, const GUID *gu
+ extern HRESULT hid_joystick_refresh_devices(void);
+ extern void hid_joystick_cleanup_devices(void);
+ 
++extern const WCHAR ps5_joystick_path[];
++extern BOOL ps5_joystick_get_instance( DIDEVICEINSTANCEW *instance );
++extern HRESULT ps5_joystick_create_device( struct dinput *dinput, const GUID *guid, const DIDEVICEINSTANCEW *instance,
++                                           DWORD joy_id, IDirectInputDevice8W **out );
++
+ struct DevicePlayer {
+     GUID instance_guid;
+     WCHAR username[MAX_PATH];
+diff --git a/dlls/dinput/joystick_hid.c b/dlls/dinput/joystick_hid.c
+--- a/dlls/dinput/joystick_hid.c
++++ b/dlls/dinput/joystick_hid.c
+@@ -1864,6 +1864,7 @@ HRESULT hid_joystick_refresh_devices(void)
+     static const WCHAR *dinput_path = L"System\\CurrentControlSet\\Control\\MediaProperties\\"
+                                        "PrivateProperties\\DirectInput";
+ 
++    DIDEVICEINSTANCEW ps5_instance;
+     WCHAR *paths = NULL;
+     HANDLE device;
+     HANDLE mutex;
+@@ -1901,6 +1902,13 @@ HRESULT hid_joystick_refresh_devices(void)
+     }
+     free( paths );
+ 
++    /* A PS5 title has no HID stack: its controller is listed from the title's sink. */
++    if (ps5_joystick_get_instance( &ps5_instance ))
++    {
++        ps5_instance.guidInstance = create_instance_uuid();
++        if (SUCCEEDED(insert_cache_entry( &ps5_instance, MAX_JOY_ID + 1, ps5_joystick_path ))) hr = DI_OK;
++    }
++
+     assign_joystick_ids();
+     save_registry_instances( root );
+     ReleaseMutex( mutex );
+@@ -2299,6 +2307,9 @@ HRESULT hid_joystick_create_device( struct dinput *dinput, const GUID *guid, IDi
+ 
+     if (FAILED(hr = get_instance_from_guid( guid, &instance, &joy_id, device_path ))) return hr;
+ 
++    if (!wcscmp( device_path, ps5_joystick_path ))
++        return ps5_joystick_create_device( dinput, guid, &instance, joy_id, out );
++
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+     dinput_device_init( &impl->base, &hid_joystick_vtbl, guid, dinput );
+     impl->joy_id = joy_id;
+diff --git a/dlls/dinput/joystick_ps5.c b/dlls/dinput/joystick_ps5.c
+new file mode 100644
+--- /dev/null
++++ b/dlls/dinput/joystick_ps5.c
+@@ -0,0 +1,614 @@
++/*  DirectInput joystick for the PS5 title's controller
++ *
++ * Copyright 2026 prospero-win
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <string.h>
++#include <math.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "winuser.h"
++#include "winerror.h"
++
++#include "hidusage.h"
++#include "devguid.h"
++#include "dinput.h"
++
++#include "dinput_private.h"
++#include "device_private.h"
++
++#include "wine/debug.h"
++#include "wine/unixlib.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(dinput);
++
++/* A PS5 title runs Wine in its own process, with no winedevice to carry a
++ * HID stack, so the HID joysticks of joystick_hid.c never find its DualSense.
++ * The title keeps the controller's state, in XINPUT_GAMEPAD terms, in its
++ * sink, and the Unix library of xinput (patch 0470, xinput1_3.so, loaded by
++ * name) reads it. This joystick reads the same state through that library
++ * and offers it as a DirectInput gamepad, laid out as an Xbox 360 controller
++ * is on Windows: X and Y (left stick), Z (the triggers, left positive),
++ * X and Y rotation (right stick), a hat switch (the d-pad) and ten buttons.
++ * Where the library is missing, as anywhere but in a title, there is no
++ * such device and DirectInput is unchanged. */
++
++/* The wire layout of the library's calls: keep in step with
++ * dlls/xinput1_3/unixlib.h (patch 0470). It holds no pointers, so both
++ * sides of WoW64 read it alike. */
++struct ps5_pad_state
++{
++    UINT32 connected;
++    UINT32 packet;
++    UINT16 buttons;
++    BYTE left_trigger;
++    BYTE right_trigger;
++    INT16 thumb_lx;
++    INT16 thumb_ly;
++    INT16 thumb_rx;
++    INT16 thumb_ry;
++};
++
++enum ps5_unix_funcs
++{
++    ps5_unix_pad_init,
++    ps5_unix_pad_state,
++    ps5_unix_pad_rumble,
++};
++
++/* XINPUT_GAMEPAD_* */
++#define PS5_DPAD_UP        0x0001
++#define PS5_DPAD_DOWN      0x0002
++#define PS5_DPAD_LEFT      0x0004
++#define PS5_DPAD_RIGHT     0x0008
++#define PS5_START          0x0010
++#define PS5_BACK           0x0020
++#define PS5_LEFT_THUMB     0x0040
++#define PS5_RIGHT_THUMB    0x0080
++#define PS5_LEFT_SHOULDER  0x0100
++#define PS5_RIGHT_SHOULDER 0x0200
++#define PS5_A              0x1000
++#define PS5_B              0x2000
++#define PS5_X              0x4000
++#define PS5_Y              0x8000
++
++/* What a wired Xbox 360 controller reports, which games look for; the
++ * same identity xinput gives it. */
++#define PS5_PAD_VID 0x045e
++#define PS5_PAD_PID 0x028e
++
++#define PS5_AXIS_COUNT   5
++#define PS5_POV_COUNT    1
++#define PS5_BUTTON_COUNT 10
++#define PS5_VALUE_COUNT  (PS5_AXIS_COUNT + PS5_POV_COUNT)
++#define PS5_OBJECT_COUNT (PS5_VALUE_COUNT + PS5_BUTTON_COUNT)
++/* As in joystick_hid.c: the values first, one LONG each, then the buttons,
++ * one byte each. */
++#define PS5_BUTTON_OFS   (PS5_VALUE_COUNT * sizeof(LONG))
++
++/* The name carries "ig_", as the HID path of a real XInput controller
++ * does, for games that leave those to XInput. Lower case, as the cache
++ * keeps paths. */
++const WCHAR ps5_joystick_path[] =
++    L"\\\\?\\hid#vid_045e&pid_028e&ig_00#ps5_title_pad#{4d1e55b2-f16f-11cf-88cb-001111000030}";
++
++static const WCHAR ps5_joystick_name[] = L"Controller (XBOX 360 For Windows)";
++
++static const UINT16 ps5_button_masks[PS5_BUTTON_COUNT] =
++{
++    PS5_A, PS5_B, PS5_X, PS5_Y, PS5_LEFT_SHOULDER, PS5_RIGHT_SHOULDER,
++    PS5_BACK, PS5_START, PS5_LEFT_THUMB, PS5_RIGHT_THUMB,
++};
++
++static const WCHAR *const ps5_button_names[PS5_BUTTON_COUNT] =
++{
++    L"Button 0", L"Button 1", L"Button 2", L"Button 3", L"Button 4",
++    L"Button 5", L"Button 6", L"Button 7", L"Button 8", L"Button 9",
++};
++
++static unixlib_handle_t pad_lib;
++
++static BOOL WINAPI find_pad_lib( INIT_ONCE *once, void *param, void **context )
++{
++    UNICODE_STRING name = RTL_CONSTANT_STRING( L"xinput1_3" );
++    unixlib_module_t module;
++    unixlib_handle_t handle;
++    NTSTATUS status;
++
++    if ((status = __wine_load_unix_lib( &name, &module, &handle )))
++    {
++        TRACE( "no xinput Unix library, status %#lx: HID joysticks only\n", status );
++        return TRUE;
++    }
++    if ((status = __wine_unix_call( handle, ps5_unix_pad_init, NULL )))
++    {
++        TRACE( "no title, status %#lx: HID joysticks only\n", status );
++        __wine_unload_unix_lib( module );
++        return TRUE;
++    }
++    TRACE( "the title's controller is a joystick\n" );
++    pad_lib = handle;
++    return TRUE;
++}
++
++static BOOL ps5_pad_available(void)
++{
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++    InitOnceExecuteOnce( &once, find_pad_lib, NULL, NULL );
++    return pad_lib != 0;
++}
++
++/* The title's controller state; all zero (neutral) when it is
++ * disconnected. */
++static void ps5_pad_read( struct ps5_pad_state *pad )
++{
++    memset( pad, 0, sizeof(*pad) );
++    if (!pad_lib) return;
++    if (__wine_unix_call( pad_lib, ps5_unix_pad_state, pad )) memset( pad, 0, sizeof(*pad) );
++}
++
++static DWORD ps5_device_type( DWORD version )
++{
++    if (version >= 0x0800) return DI8DEVTYPE_GAMEPAD | (DI8DEVTYPEGAMEPAD_STANDARD << 8) | DIDEVTYPE_HID;
++    return DIDEVTYPE_JOYSTICK | (DIDEVTYPEJOYSTICK_GAMEPAD << 8) | DIDEVTYPE_HID;
++}
++
++/* The device DirectInput lists for the title's controller, in the form the
++ * joystick cache keeps (a DirectInput 8 type). FALSE when there is none:
++ * not in a title, or the controller is not connected. */
++BOOL ps5_joystick_get_instance( DIDEVICEINSTANCEW *instance )
++{
++    struct ps5_pad_state pad;
++
++    if (!ps5_pad_available()) return FALSE;
++    ps5_pad_read( &pad );
++    if (!pad.connected) return FALSE;
++
++    memset( instance, 0, sizeof(*instance) );
++    instance->dwSize = sizeof(*instance);
++    instance->guidProduct = dinput_pidvid_guid;
++    instance->guidProduct.Data1 = MAKELONG( PS5_PAD_VID, PS5_PAD_PID );
++    instance->guidFFDriver = GUID_NULL;
++    instance->wUsagePage = HID_USAGE_PAGE_GENERIC;
++    instance->wUsage = HID_USAGE_GENERIC_GAMEPAD;
++    instance->dwDevType = ps5_device_type( 0x0800 );
++    lstrcpynW( instance->tszInstanceName, ps5_joystick_name, MAX_PATH );
++    lstrcpynW( instance->tszProductName, ps5_joystick_name, MAX_PATH );
++    return TRUE;
++}
++
++struct ps5_joystick
++{
++    struct dinput_device base;
++
++    DWORD joy_id;
++    BOOL valid;       /* the state below came from a read */
++    UINT32 connected;
++    UINT32 packet;
++};
++
++static inline struct ps5_joystick *impl_from_IDirectInputDevice8W( IDirectInputDevice8W *iface )
++{
++    return CONTAINING_RECORD( CONTAINING_RECORD( iface, struct dinput_device, IDirectInputDevice8W_iface ),
++                              struct ps5_joystick, base );
++}
++
++/* Objects 0 to 4 are the axes, 5 the hat switch, 6 to 15 the buttons. */
++static void ps5_object_instance_fill( UINT index, DIDEVICEOBJECTINSTANCEW *instance )
++{
++    static const WORD axis_usages[PS5_AXIS_COUNT] =
++    {
++        HID_USAGE_GENERIC_X, HID_USAGE_GENERIC_Y, HID_USAGE_GENERIC_Z,
++        HID_USAGE_GENERIC_RX, HID_USAGE_GENERIC_RY,
++    };
++    static const WCHAR *const axis_names[PS5_AXIS_COUNT] =
++    {
++        L"X Axis", L"Y Axis", L"Z Axis", L"X Rotation", L"Y Rotation",
++    };
++    const GUID *axis_guids[PS5_AXIS_COUNT] = { &GUID_XAxis, &GUID_YAxis, &GUID_ZAxis, &GUID_RxAxis, &GUID_RyAxis };
++
++    memset( instance, 0, sizeof(*instance) );
++    instance->dwSize = sizeof(*instance);
++    instance->wUsagePage = HID_USAGE_PAGE_GENERIC;
++
++    if (index < PS5_AXIS_COUNT)
++    {
++        instance->dwOfs = index * sizeof(LONG);
++        instance->dwType = DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE( axis_usages[index] - HID_USAGE_GENERIC_X );
++        instance->dwFlags = DIDOI_ASPECTPOSITION;
++        instance->guidType = *axis_guids[index];
++        instance->wUsage = axis_usages[index];
++        lstrcpynW( instance->tszName, axis_names[index], MAX_PATH );
++    }
++    else if (index < PS5_VALUE_COUNT)
++    {
++        instance->dwOfs = PS5_AXIS_COUNT * sizeof(LONG);
++        instance->dwType = DIDFT_POV | DIDFT_MAKEINSTANCE( 0 );
++        instance->guidType = GUID_POV;
++        instance->wUsage = HID_USAGE_GENERIC_HATSWITCH;
++        lstrcpynW( instance->tszName, L"Hat Switch", MAX_PATH );
++    }
++    else
++    {
++        UINT button = index - PS5_VALUE_COUNT;
++
++        instance->dwOfs = PS5_BUTTON_OFS + button;
++        instance->dwType = DIDFT_PSHBUTTON | DIDFT_MAKEINSTANCE( button );
++        instance->guidType = GUID_Button;
++        instance->wUsagePage = HID_USAGE_PAGE_BUTTON;
++        instance->wUsage = button + 1;
++        lstrcpynW( instance->tszName, ps5_button_names[button], MAX_PATH );
++    }
++}
++
++/* The axes' scaling of joystick_hid.c, for sticks and triggers of 16 bits
++ * and a logical range of 0 to 65535: the dead zone and saturation the
++ * application set, and its range. */
++static LONG ps5_scale_axis( LONG value, const struct object_properties *properties )
++{
++    LONG log_ctr, log_min, log_max, phy_ctr, phy_min, phy_max;
++
++    log_min = properties->logical_min;
++    log_max = properties->logical_max;
++    phy_min = properties->range_min;
++    phy_max = properties->range_max;
++
++    if (phy_min == 0) phy_ctr = phy_max >> 1;
++    else phy_ctr = round( (phy_min + phy_max) / 2.0 );
++    if (log_min == 0) log_ctr = log_max >> 1;
++    else log_ctr = round( (log_min + log_max) / 2.0 );
++
++    value -= log_ctr;
++    if (value <= 0)
++    {
++        log_max = MulDiv( log_min - log_ctr, properties->deadzone, 10000 );
++        log_min = MulDiv( log_min - log_ctr, properties->saturation, 10000 );
++        phy_max = phy_ctr;
++    }
++    else
++    {
++        log_min = MulDiv( log_max - log_ctr, properties->deadzone, 10000 );
++        log_max = MulDiv( log_max - log_ctr, properties->saturation, 10000 );
++        phy_min = phy_ctr;
++    }
++
++    if (value <= log_min) return phy_min;
++    if (value >= log_max) return phy_max;
++    return phy_min + MulDiv( value - log_min, phy_max - phy_min, log_max - log_min );
++}
++
++/* The d-pad as a hat switch: hundredths of a degree clockwise from up,
++ * -1 when centred. */
++static LONG ps5_pov_value( UINT16 buttons )
++{
++    BOOL up = buttons & PS5_DPAD_UP, down = buttons & PS5_DPAD_DOWN;
++    BOOL left = buttons & PS5_DPAD_LEFT, right = buttons & PS5_DPAD_RIGHT;
++
++    if (up && down) up = down = FALSE;
++    if (left && right) left = right = FALSE;
++
++    if (up && right) return 4500;
++    if (right && down) return 13500;
++    if (down && left) return 22500;
++    if (left && up) return 31500;
++    if (up) return 0;
++    if (right) return 9000;
++    if (down) return 18000;
++    if (left) return 27000;
++    return -1;
++}
++
++static LONG ps5_clamp_axis( LONG value )
++{
++    if (value < 0) return 0;
++    if (value > 65535) return 65535;
++    return value;
++}
++
++/* What every object holds for this controller state: the values in the
++ * range the application set, buttons 0x80 when down. */
++static void ps5_object_values( const struct ps5_pad_state *pad, const struct object_properties *properties,
++                               LONG *values )
++{
++    LONG raw[PS5_AXIS_COUNT];
++    UINT i;
++
++    /* XInput's y is up; DirectInput's is down. A trigger pushes the shared
++     * axis one way, as on Windows: the left one towards its maximum. */
++    raw[0] = pad->thumb_lx + 32768;
++    raw[1] = 32767 - pad->thumb_ly;
++    raw[2] = 32768 + ((LONG)pad->left_trigger - (LONG)pad->right_trigger) * 128;
++    raw[3] = pad->thumb_rx + 32768;
++    raw[4] = 32767 - pad->thumb_ry;
++
++    for (i = 0; i < PS5_AXIS_COUNT; ++i) values[i] = ps5_scale_axis( ps5_clamp_axis( raw[i] ), properties + i );
++    values[PS5_AXIS_COUNT] = ps5_pov_value( pad->buttons );
++    for (i = 0; i < PS5_BUTTON_COUNT; ++i)
++        values[PS5_VALUE_COUNT + i] = (pad->buttons & ps5_button_masks[i]) ? 0x80 : 0;
++}
++
++/* Reads the title's controller into the device state and queues what
++ * changed. */
++static void ps5_joystick_update( struct ps5_joystick *impl )
++{
++    IDirectInputDevice8W *iface = &impl->base.IDirectInputDevice8W_iface;
++    struct ps5_pad_state pad;
++    LONG values[PS5_OBJECT_COUNT];
++    BOOL changed = FALSE;
++    DWORD time, seq;
++    UINT i;
++
++    ps5_pad_read( &pad );
++
++    EnterCriticalSection( &impl->base.crit );
++    if (impl->valid && impl->connected == pad.connected && impl->packet == pad.packet)
++    {
++        LeaveCriticalSection( &impl->base.crit );
++        return;
++    }
++    impl->valid = TRUE;
++    impl->connected = pad.connected;
++    impl->packet = pad.packet;
++
++    time = GetCurrentTime();
++    seq = impl->base.dinput->evsequence++;
++    ps5_object_values( &pad, impl->base.object_properties, values );
++
++    for (i = 0; i < PS5_OBJECT_COUNT; ++i)
++    {
++        LONG old_value;
++
++        if (i < PS5_VALUE_COUNT)
++        {
++            old_value = *(LONG *)(impl->base.device_state + i * sizeof(LONG));
++            *(LONG *)(impl->base.device_state + i * sizeof(LONG)) = values[i];
++        }
++        else
++        {
++            old_value = impl->base.device_state[PS5_BUTTON_OFS + i - PS5_VALUE_COUNT];
++            impl->base.device_state[PS5_BUTTON_OFS + i - PS5_VALUE_COUNT] = (BYTE)values[i];
++        }
++
++        if (old_value == values[i]) continue;
++        queue_event( iface, i, values[i], time, seq );
++        changed = TRUE;
++    }
++
++    if (changed && impl->base.hEvent) SetEvent( impl->base.hEvent );
++    LeaveCriticalSection( &impl->base.crit );
++}
++
++static void ps5_joystick_destroy( IDirectInputDevice8W *iface )
++{
++    struct ps5_joystick *impl = impl_from_IDirectInputDevice8W( iface );
++    TRACE( "iface %p.\n", iface );
++
++    if (impl->base.read_event) CloseHandle( impl->base.read_event );
++}
++
++static HRESULT ps5_joystick_poll( IDirectInputDevice8W *iface )
++{
++    struct ps5_joystick *impl = impl_from_IDirectInputDevice8W( iface );
++
++    ps5_joystick_update( impl );
++    return DI_OK;
++}
++
++/* Called by the input thread whenever read_event is signaled. */
++static HRESULT ps5_joystick_read( IDirectInputDevice8W *iface )
++{
++    struct ps5_joystick *impl = impl_from_IDirectInputDevice8W( iface );
++
++    ps5_joystick_update( impl );
++    return DI_OK;
++}
++
++/* There is no report to wait for: read_event is a periodic timer, a little
++ * faster than the title refreshes the controller (every 16 ms), that
++ * keeps buffered data and event notifications flowing between polls. */
++#define PS5_POLL_PERIOD_MS 8
++
++static HRESULT ps5_joystick_acquire( IDirectInputDevice8W *iface )
++{
++    struct ps5_joystick *impl = impl_from_IDirectInputDevice8W( iface );
++    LARGE_INTEGER due = {0};
++
++    ps5_joystick_update( impl );
++    if (!SetWaitableTimer( impl->base.read_event, &due, PS5_POLL_PERIOD_MS, NULL, NULL, FALSE ))
++        return DIERR_UNPLUGGED;
++    return DI_OK;
++}
++
++static HRESULT ps5_joystick_unacquire( IDirectInputDevice8W *iface )
++{
++    struct ps5_joystick *impl = impl_from_IDirectInputDevice8W( iface );
++
++    CancelWaitableTimer( impl->base.read_event );
++    return DI_OK;
++}
++
++static HRESULT ps5_joystick_enum_objects( IDirectInputDevice8W *iface, const DIPROPHEADER *filter, DWORD flags,
++                                          enum_object_callback callback, void *context )
++{
++    struct ps5_joystick *impl = impl_from_IDirectInputDevice8W( iface );
++    DIDEVICEOBJECTINSTANCEW instance;
++    BOOL ret;
++    UINT i;
++
++    for (i = 0; i < PS5_OBJECT_COUNT; ++i)
++    {
++        ps5_object_instance_fill( i, &instance );
++        if (flags != DIDFT_ALL && !(flags & DIDFT_GETTYPE( instance.dwType ))) continue;
++
++        switch (filter->dwHow)
++        {
++        case DIPH_DEVICE:
++            break;
++        case DIPH_BYOFFSET:
++            if (filter->dwObj != instance.dwOfs) continue;
++            break;
++        case DIPH_BYID:
++            if ((filter->dwObj & 0x00ffffff) != (instance.dwType & 0x00ffffff)) continue;
++            break;
++        case DIPH_BYUSAGE:
++            if (HIWORD( filter->dwObj ) != instance.wUsagePage) continue;
++            if (LOWORD( filter->dwObj ) != instance.wUsage) continue;
++            break;
++        default:
++            FIXME( "unimplemented filter dwHow %#lx dwObj %#lx\n", filter->dwHow, filter->dwObj );
++            continue;
++        }
++
++        ret = callback( &impl->base, i, NULL, &instance, context );
++        if (ret != DIENUM_CONTINUE) return ret;
++    }
++
++    return DIENUM_CONTINUE;
++}
++
++static HRESULT ps5_joystick_get_property( IDirectInputDevice8W *iface, DWORD property,
++                                          DIPROPHEADER *header, const DIDEVICEOBJECTINSTANCEW *instance )
++{
++    struct ps5_joystick *impl = impl_from_IDirectInputDevice8W( iface );
++
++    switch (property)
++    {
++    case (DWORD_PTR)DIPROP_PRODUCTNAME:
++    {
++        DIPROPSTRING *value = (DIPROPSTRING *)header;
++        lstrcpynW( value->wsz, impl->base.instance.tszProductName, MAX_PATH );
++        return DI_OK;
++    }
++    case (DWORD_PTR)DIPROP_INSTANCENAME:
++    {
++        DIPROPSTRING *value = (DIPROPSTRING *)header;
++        lstrcpynW( value->wsz, impl->base.instance.tszInstanceName, MAX_PATH );
++        return DI_OK;
++    }
++    case (DWORD_PTR)DIPROP_VIDPID:
++    {
++        DIPROPDWORD *value = (DIPROPDWORD *)header;
++        value->dwData = MAKELONG( PS5_PAD_VID, PS5_PAD_PID );
++        return DI_OK;
++    }
++    case (DWORD_PTR)DIPROP_JOYSTICKID:
++    {
++        DIPROPDWORD *value = (DIPROPDWORD *)header;
++        value->dwData = impl->joy_id;
++        return DI_OK;
++    }
++    case (DWORD_PTR)DIPROP_GUIDANDPATH:
++    {
++        DIPROPGUIDANDPATH *value = (DIPROPGUIDANDPATH *)header;
++        value->guidClass = GUID_DEVCLASS_HIDCLASS;
++        lstrcpynW( value->wszPath, ps5_joystick_path, MAX_PATH );
++        return DI_OK;
++    }
++    }
++
++    return DIERR_UNSUPPORTED;
++}
++
++/* No force feedback: the effect entries stay NULL, and the device does not
++ * claim DIDC_FORCEFEEDBACK, which keeps the generic code from calling them. */
++static const struct dinput_device_vtbl ps5_joystick_vtbl =
++{
++    ps5_joystick_destroy,
++    ps5_joystick_poll,
++    ps5_joystick_read,
++    ps5_joystick_acquire,
++    ps5_joystick_unacquire,
++    ps5_joystick_enum_objects,
++    ps5_joystick_get_property,
++    NULL,
++    NULL,
++    NULL,
++    NULL,
++    NULL,
++};
++
++/* The axes' ranges as joystick_hid.c's init_object_properties gives them. */
++static void ps5_init_object_properties( struct dinput_device *device )
++{
++    UINT i;
++
++    for (i = 0; i < PS5_VALUE_COUNT; ++i)
++    {
++        struct object_properties *properties = device->object_properties + i;
++
++        if (i < PS5_AXIS_COUNT)
++        {
++            properties->bit_size = 16;
++            properties->physical_min = 0;
++            properties->physical_max = 65535;
++            properties->logical_min = 0;
++            properties->logical_max = 65535;
++            properties->range_min = 0;
++            properties->range_max = 65535;
++        }
++        else
++        {
++            properties->bit_size = 4;
++            properties->physical_min = 0;
++            properties->physical_max = 7;
++            properties->logical_min = 0;
++            properties->logical_max = 7;
++            properties->range_min = 0;
++            properties->range_max = 31500;
++        }
++
++        properties->saturation = 10000;
++        properties->granularity = 1;
++    }
++}
++
++HRESULT ps5_joystick_create_device( struct dinput *dinput, const GUID *guid, const DIDEVICEINSTANCEW *instance,
++                                    DWORD joy_id, IDirectInputDevice8W **out )
++{
++    struct ps5_joystick *impl;
++    HRESULT hr;
++
++    TRACE( "dinput %p, guid %s, out %p\n", dinput, debugstr_guid( guid ), out );
++
++    *out = NULL;
++    if (!ps5_pad_available()) return DIERR_DEVICENOTREG;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    dinput_device_init( &impl->base, &ps5_joystick_vtbl, guid, dinput );
++    impl->joy_id = joy_id;
++    impl->base.crit.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": ps5_joystick.base.crit");
++    impl->base.dwCoopLevel = DISCL_NONEXCLUSIVE | DISCL_BACKGROUND;
++    impl->base.read_event = CreateWaitableTimerW( NULL, FALSE, NULL );
++    impl->base.instance = *instance;
++    impl->base.instance.dwDevType = ps5_device_type( dinput->dwVersion );
++    impl->base.caps.dwDevType = impl->base.instance.dwDevType;
++
++    hr = DIERR_OUTOFMEMORY;
++    if (!impl->base.read_event) goto failed;
++    if (FAILED(hr = dinput_device_init_device_format( &impl->base.IDirectInputDevice8W_iface ))) goto failed;
++    ps5_init_object_properties( &impl->base );
++
++    *out = &impl->base.IDirectInputDevice8W_iface;
++    return DI_OK;
++
++failed:
++    IDirectInputDevice_Release( &impl->base.IDirectInputDevice8W_iface );
++    return hr;
++}
+diff --git a/dlls/dinput8/Makefile.in b/dlls/dinput8/Makefile.in
+--- a/dlls/dinput8/Makefile.in
++++ b/dlls/dinput8/Makefile.in
+@@ -17,5 +17,6 @@ SOURCES = \
+ 	dinput8.idl \
+ 	dinput_main.c \
+ 	joystick_hid.c \
++	joystick_ps5.c \
+ 	keyboard.c \
+ 	mouse.c
+-- 
+2.43.0
+
