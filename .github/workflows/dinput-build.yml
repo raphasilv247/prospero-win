@@ -1,0 +1,50 @@
+name: dinput patch build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "wine/patches/0475-*"
+      - ".github/workflows/dinput-build.yml"
+
+jobs:
+  dinput:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex gettext \
+            gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 git
+
+      - name: Pinned Wine
+        run: |
+          WINE_COMMIT=$(grep -m1 '^WINE_COMMIT=' tools/build_wine_ps5.sh | cut -d= -f2)
+          git init wine && cd wine
+          git remote add origin https://github.com/wine-mirror/wine.git
+          git fetch --depth 1 origin "$WINE_COMMIT"
+          git checkout -q FETCH_HEAD
+
+      - name: Apply patch 0475
+        run: git -C wine apply ../wine/patches/0475-dinput-ps5-title-controller.patch
+
+      - name: Configure
+        run: |
+          mkdir build && cd build
+          ../wine/configure --enable-archs=i386,x86_64 --disable-tests \
+            --without-x --without-freetype --without-gstreamer
+
+      - name: Build dinput and dinput8
+        run: |
+          cd build
+          make -j"$(nproc)" \
+            dlls/dinput/x86_64-windows/dinput.dll dlls/dinput8/x86_64-windows/dinput8.dll \
+            dlls/dinput/i386-windows/dinput.dll dlls/dinput8/i386-windows/dinput8.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dinput-dlls
+          path: build/dlls/dinput*/*-windows/*.dll
